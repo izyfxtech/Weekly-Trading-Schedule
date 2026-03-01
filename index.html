@@ -4,12 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>IZY — Weekly Schedule</title>
-<link rel="manifest" href="manifest.json">
-<meta name="theme-color" content="#090704">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="IZY">
-<link rel="apple-touch-icon" href="icons/icon-192.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -756,6 +750,8 @@ body {
       <input type="file" id="importFile" accept=".json" style="display:none" onchange="importSchedule(event)">
       <button class="btn" onclick="saveSchedule()" title="All edits are auto-saved. Click to confirm.">Force Save</button>
       <div class="toolbar-sep"></div>
+      <button class="btn" id="notifBtn" onclick="toggleNotifications()" title="Toggle block start notifications">🔕 Notifs Off</button>
+      <div class="toolbar-sep"></div>
       <button class="btn btn-danger" onclick="showResetConfirm()" title="Reset this day to its default template">Reset Day</button>
     </div>
   </div>
@@ -995,7 +991,13 @@ function loadFromStorage() {
     }
   } catch(e) { weekData = {}; }
   for (let i = 0; i < 7; i++) {
-    if (!weekData[i] || !Array.isArray(weekData[i])) weekData[i] = getTemplate(i);
+    if (!weekData[i] || !Array.isArray(weekData[i])) {
+      weekData[i] = getTemplate(i);
+    } else {
+      // Sort on load so Sleep (00:15 → offset 1455 mins) always lands
+      // at the end of the day list, not incorrectly shown as "Up Next"
+      weekData[i].sort((a, b) => timeToMins(a.time) - timeToMins(b.time));
+    }
   }
 }
 
@@ -1741,16 +1743,175 @@ const renderInterval = setInterval(() => renderSchedule(), 300000);
 window.addEventListener('beforeunload', () => {
   clearInterval(clockInterval);
   clearInterval(renderInterval);
+  cancelAllNotifications();
 });
+
+// ─────────────────────────────────────────────────────
+// NOTIFICATIONS
+// ─────────────────────────────────────────────────────
+const NOTIF_KEY = 'izy-notifications-enabled';
+let _notifTimers = [];
+
+function notificationsEnabled() {
+  try { return localStorage.getItem(NOTIF_KEY) === 'true'; } catch(e) { return false; }
+}
+
+function setNotificationsEnabled(val) {
+  try { localStorage.setItem(NOTIF_KEY, val ? 'true' : 'false'); } catch(e) {}
+}
+
+function cancelAllNotifications() {
+  _notifTimers.forEach(id => clearTimeout(id));
+  _notifTimers = [];
+}
+
+// Schedule browser notifications for all upcoming blocks today
+function scheduleNotifications() {
+  cancelAllNotifications();
+  if (!notificationsEnabled()) return;
+  if (Notification.permission !== 'granted') return;
+
+  const today = todayIdx();
+  const blocks = weekData[today] || [];
+  const now = new Date();
+  const nowMs = now.getTime();
+
+  blocks.forEach(block => {
+    const [h, m] = block.time.split(':').map(Number);
+    const blockDate = new Date();
+    blockDate.setHours(h, m, 0, 0);
+    // If block time is before 6am treat as next day
+    if (h < 6) blockDate.setDate(blockDate.getDate() + 1);
+
+    const msUntil = blockDate.getTime() - nowMs;
+    if (msUntil <= 0) return; // already passed
+
+    // Notify exactly at block start
+    const id = setTimeout(() => {
+      const icon = 'icons/icon-192.png';
+      if (block.prep) {
+        showNotification(
+          '◈ Candle Close Approaching',
+          block.sub || 'Prepare for candle close',
+          icon
+        );
+      } else {
+        showNotification(
+          `▶ ${block.title}`,
+          block.sub ? block.sub.slice(0, 80) : `Starting now · ${block.duration || ''}`,
+          icon
+        );
+      }
+      // Re-schedule for next day after midnight blocks fire
+    }, msUntil);
+
+    _notifTimers.push(id);
+
+    // Also send a 2-minute warning for non-prep trade blocks
+    if (!block.prep && block.type === 't-trade' && msUntil > 2 * 60 * 1000) {
+      const warnId = setTimeout(() => {
+        showNotification(
+          `⚡ Trade Check in 2 mins`,
+          `${block.title} starts at ${fmt12(block.time)}`,
+          'icons/icon-192.png'
+        );
+      }, msUntil - 2 * 60 * 1000);
+      _notifTimers.push(warnId);
+    }
+  });
+
+  console.log(`[IZY] Scheduled ${_notifTimers.length} notifications for today`);
+}
+
+function showNotification(title, body, icon) {
+  if (Notification.permission !== 'granted') return;
+  // Use service worker notification if available (works when app is in background)
+  if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+    navigator.serviceWorker.ready.then(reg => {
+      reg.showNotification(title, {
+        body,
+        icon,
+        badge: icon,
+        vibrate: [200, 100, 200],
+        tag: 'izy-block',
+        renotify: true,
+      });
+    });
+  } else {
+    // Fallback to direct notification (app must be open/focused)
+    new Notification(title, { body, icon });
+  }
+}
+
+async function requestNotificationPermission() {
+  if (!('Notification' in window)) {
+    showToast('Notifications not supported in this browser');
+    return;
+  }
+
+  if (Notification.permission === 'granted') {
+    setNotificationsEnabled(true);
+    scheduleNotifications();
+    syncNotifButton();
+    showToast('Notifications enabled ✓');
+    return;
+  }
+
+  if (Notification.permission === 'denied') {
+    showToast('Notifications blocked — enable in browser settings');
+    return;
+  }
+
+  const result = await Notification.requestPermission();
+  if (result === 'granted') {
+    setNotificationsEnabled(true);
+    scheduleNotifications();
+    syncNotifButton();
+    showToast('Notifications enabled ✓');
+  } else {
+    showToast('Notification permission denied');
+  }
+}
+
+function toggleNotifications() {
+  if (notificationsEnabled()) {
+    setNotificationsEnabled(false);
+    cancelAllNotifications();
+    syncNotifButton();
+    showToast('Notifications disabled');
+  } else {
+    requestNotificationPermission();
+  }
+}
+
+function syncNotifButton() {
+  const btn = document.getElementById('notifBtn');
+  if (!btn) return;
+  const on = notificationsEnabled() && Notification.permission === 'granted';
+  btn.textContent = on ? '🔔 Notifs On' : '🔕 Notifs Off';
+  btn.classList.toggle('btn-primary', on);
+}
+
+// Re-schedule every hour as a safety net (handles midnight rollover)
+setInterval(() => scheduleNotifications(), 60 * 60 * 1000);
 
 // ─── PWA: Register Service Worker ───
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('sw.js')
-      .then(reg => console.log('[IZY] SW registered:', reg.scope))
+      .then(reg => {
+        console.log('[IZY] SW registered:', reg.scope);
+        // Init notifications after SW is ready
+        if (notificationsEnabled() && Notification.permission === 'granted') {
+          scheduleNotifications();
+        }
+      })
       .catch(err => console.warn('[IZY] SW registration failed:', err));
   });
 }
+
+// Init notif button state on load
+window.addEventListener('DOMContentLoaded', () => syncNotifButton());
 </script>
 </body>
 </html>
